@@ -1,10 +1,10 @@
 ﻿services:
   - type: web
     name: farangfm-bot
-    runtime: python
+    runtime: image
+    repo: https://github.com/Krlgor/farangfm-bot
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: BOT_TOKEN
         sync: false
