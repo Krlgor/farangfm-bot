@@ -1,5 +1,5 @@
 ﻿services:
-  - type: worker
+  - type: web
     name: farangfm-bot
     runtime: python
     plan: free
