@@ -7,7 +7,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 def get_db_connection():
-    \"\"\"Получение соединения с PostgreSQL\"\"\"
+    """Получение соединения с PostgreSQL"""
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         logger.error("DATABASE_URL not set!")
@@ -15,7 +15,7 @@ def get_db_connection():
     return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
 
 def init_db():
-    \"\"\"Инициализация таблиц БД\"\"\"
+    """Инициализация таблиц БД"""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -41,30 +41,34 @@ def init_db():
                     )
                 """)
                 conn.commit()
-                logger.info("✅ Database tables initialized")
+                logger.info("Database tables initialized")
     except Exception as e:
         logger.error(f"Database init error: {e}")
         raise
 
 def get_post(post_id: str):
+    """Получить пост по ID"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM posts WHERE id = %s", (post_id,))
             return cur.fetchone()
 
 def update_post_status(post_id: str, status: str):
+    """Обновить статус поста"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE posts SET status = %s WHERE id = %s", (status, post_id))
             conn.commit()
 
 def update_post_text(post_id: str, new_text: str):
+    """Обновить текст поста"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE posts SET rewritten_text = %s WHERE id = %s", (new_text, post_id))
             conn.commit()
 
 def get_pending_posts(limit=10):
+    """Получить посты на модерации"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -76,6 +80,7 @@ def get_pending_posts(limit=10):
             return cur.fetchall()
 
 def get_schedule():
+    """Получить все расписания"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM schedule")
@@ -83,18 +88,21 @@ def get_schedule():
             return {row['key_name']: row for row in rows}
 
 def toggle_scheduled_post(key: str, enabled: bool):
+    """Включить/выключить расписание"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE schedule SET enabled = %s WHERE key_name = %s", (enabled, key))
             conn.commit()
 
 def remove_scheduled_post(key: str):
+    """Удалить расписание"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM schedule WHERE key_name = %s", (key,))
             conn.commit()
 
 def add_scheduled_post(key: str, display_name: str, time_val: str, stream: str, template: str):
+    """Добавить или обновить расписание"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -107,4 +115,4 @@ def add_scheduled_post(key: str, display_name: str, time_val: str, stream: str, 
                     template = EXCLUDED.template
             """, (key, display_name, time_val, stream, template))
             conn.commit()
-            logger.info(f"✅ Scheduled post added: {key} at {time_val}")
+            logger.info(f"Scheduled post added: {key} at {time_val}")
