@@ -1,0 +1,32 @@
+﻿services:
+  - type: worker
+    name: farangfm-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: WEBSITE_URL
+        value: https://farang-fm.netlify.app/
+      - key: CHANNEL_URL
+        value: https://t.me/farangfm
+      - key: BOT_USERNAME
+        value: farangfm_bot
+      - key: PORT
+        value: 8080
+      - key: DATABASE_URL
+        fromDatabase:
+          name: farangfm-db
+          property: connectionString
+
+databases:
+  - name: farangfm-db
+    plan: free
