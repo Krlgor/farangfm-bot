@@ -102,7 +102,7 @@ def run_health_server():
     httpd.serve_forever()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TRANSLATIONS (сокращено для читаемости, полная версия в архиве)
+# TRANSLATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 T = {
@@ -595,14 +595,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WEBHOOK HANDLER (для приёма постов от n8n)
-# ══════════════════════════════════responseAskingViewsBinding═════════════════════════════════════════════
-
-# Для простоты, webhook эндпоинт можно добавить позже через Flask/FastAPI
-# Пока оставляем polling режим, а посты от n8n будут приходить через отдельный сервер
-# Или можно интегрировать с текущим ботом через webhook_url
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -644,14 +636,15 @@ def main():
     app.add_handler(CallbackQueryHandler(approve_post, pattern="^approve_"))
     app.add_handler(CallbackQueryHandler(reject_post, pattern="^reject_"))
     app.add_handler(CallbackQueryHandler(on_callback))
-        app.add_error_handler(error_handler)
+    app.add_error_handler(error_handler)
     
-    # Scheduled posts: check every minute
+    # Scheduled posts: check every minute (only if JobQueue is available)
     if app.job_queue:
         app.job_queue.run_repeating(scheduled_post_job, interval=60, first=10)
+        logger.info("⏰ Scheduled posts enabled")
     else:
-        logger.warning("⚠️ JobQueue is not available! Scheduled posts disabled.")
-        logger.warning("Install: pip install 'python-telegram-bot[job-queue]'")
+        logger.warning("⚠️ JobQueue not available. Scheduled posts disabled.")
+        logger.warning("To enable, install: pip install 'python-telegram-bot[job-queue]'")
     
     logger.info("🚀 Bot is running! Starting polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
