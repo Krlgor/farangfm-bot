@@ -647,7 +647,11 @@ def main():
     app.add_error_handler(error_handler)
     
     # Scheduled posts: check every minute
+    if app.job_queue:
     app.job_queue.run_repeating(scheduled_post_job, interval=60, first=10)
+else:
+    logger.warning("⚠️ JobQueue is not available! Scheduled posts disabled.")
+    logger.warning("Install: pip install 'python-telegram-bot[job-queue]'")
     
     logger.info("🚀 Bot is running! Starting polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
