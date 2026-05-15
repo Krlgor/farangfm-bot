@@ -1,19 +1,22 @@
 """
-FARANG.FM TELEGRAM BOT v5.0 - Clean Moderation Bot
+FARANG.FM TELEGRAM BOT v6.0 - С вебхуком для модерации
 - Language selection: RU / EN / TH
 - Listen Now → Telegram Mini App
 - Moderation system: approve / reject / edit
 - Admin: /post, /pending
-- NO built-in AI generation (handled by n8n)
-- NO built-in scheduled posts (handled by n8n)
+- Webhook endpoint /webhook для приёма постов от n8n
 """
 
 import os
 import sys
 import logging
+import json
 from functools import wraps
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+
+import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
@@ -25,18 +28,19 @@ from telegram.error import TelegramError
 
 from database import (
     init_db, get_post, update_post_status, update_post_text,
-    get_pending_posts,
+    get_pending_posts, get_db_connection,
 )
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # CONFIG
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 TOKEN       = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID  = os.getenv("CHANNEL_ID", "")
 ADMIN_ID    = int(os.getenv("ADMIN_ID", "0"))
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://farang-fm.netlify.app/")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/farangfm")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "0369819604040d86dbdcaf24f7a19b695ef1c79d2840a7df")
 
 if not TOKEN:
     logging.error("BOT_TOKEN not set!")
@@ -62,17 +66,17 @@ STATE_EDIT_TEXT = 0
 # In-memory language store
 USER_LANG: dict[int, str] = {}
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # STREAMS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 STREAMS = {"LOFI": "🌙", "CHILL": "🌊", "ROAD": "🛵", "DANCE": "🔥"}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HEALTH CHECK SERVER (для Render / UptimeRobot)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
+# HTTP SERVER (health + webhook)
+# ============================================
 
-class HealthHandler(BaseHTTPRequestHandler):
+class CombinedHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
@@ -81,20 +85,121 @@ class HealthHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-    
+        self.log_message("GET %s", self.path)
+
+    def do_POST(self):
+        if self.path == "/webhook":
+            self.handle_webhook()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def handle_webhook(self):
+        """Обрабатывает POST-запросы от n8n."""
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+
+        # Проверка авторизации
+        auth_header = self.headers.get('Authorization', '')
+        token = auth_header.split(' ')[1] if auth_header.startswith('Bearer ') else None
+        if token != WEBHOOK_SECRET:
+            logger.warning(f"Unauthorized webhook attempt")
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
+            return
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
+            return
+
+        post_id = data.get('post_id')
+        original_text = data.get('original_text', '')
+        rewritten_text = data.get('rewritten_text', '')
+        source = data.get('source', 'unknown')
+        category = data.get('category', 'news')
+
+        if not post_id:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing post_id"}).encode())
+            return
+
+        # Сохраняем в БД (статус pending)
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO posts (id, original_text, rewritten_text, source, category, status)
+                        VALUES (%s, %s, %s, %s, %s, 'pending')
+                        ON CONFLICT (id) DO UPDATE SET
+                            original_text = EXCLUDED.original_text,
+                            rewritten_text = EXCLUDED.rewritten_text,
+                            status = 'pending'
+                    """, (post_id, original_text, rewritten_text, source, category))
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"DB error: {e}")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Database error"}).encode())
+            return
+
+        # Отправляем админу на модерацию
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Publish", "callback_data": f"approve_{post_id}"},
+                    {"text": "❌ Reject", "callback_data": f"reject_{post_id}"}
+                ],
+                [{"text": "✏️ Edit", "callback_data": f"edit_{post_id}"}]
+            ]
+        }
+
+        send_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        payload = {
+            "chat_id": ADMIN_ID,
+            "text": f"📝 <b>Новый пост от {source}</b>\n\n{rewritten_text[:300]}\n\n<i>Категория: {category}</i>",
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(keyboard)
+        }
+
+        try:
+            resp = requests.post(send_url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logger.info(f"Post {post_id} sent to admin for moderation")
+            else:
+                logger.error(f"Failed to send to admin: {resp.text}")
+        except Exception as e:
+            logger.error(f"Telegram send error: {e}")
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": True, "id": post_id}).encode())
+
     def log_message(self, format, *args):
-        pass
+        logger.info(f"HTTP: {format % args}")
 
-def run_health_server():
+def run_http_server():
     port = int(os.getenv("PORT", 8080))
-    httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"🏥 Health server running on port {port}")
-    httpd.serve_forever()
+    server = HTTPServer(("0.0.0.0", port), CombinedHandler)
+    logger.info(f"🏁 HTTP server running on port {port} (health + webhook)")
+    server.serve_forever()
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # TRANSLATIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
+# (Полные словари T — они у вас уже есть, я их оставлю как в вашем файле.
+# Чтобы сэкономить место, вставьте сюда ВАШИ словари из bot.py. 
+# Они не изменились.)
 
+# ВНИМАНИЕ: Ниже должны быть ВАШИ полные словари T (ru, en, th).
+# Скопируйте их из вашего текущего bot.py в этот файл.
+# Здесь я приведу только заглушку.
 T = {
     "ru": {
         "welcome": "<b>🎙️ Добро пожаловать на FARANG.FM!</b>\n\nПривет, {name}! 👋\n\nКруглосуточное тропическое радио из Таиланда 🌴\n\n<i>🌙 LOFI · 🌊 CHILL · 🛵 ROAD · 🔥 DANCE</i>",
@@ -176,9 +281,9 @@ T = {
     },
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 def tx(user_id: int, key: str, **kwargs) -> str:
     lang = USER_LANG.get(user_id, "en")
@@ -221,9 +326,9 @@ def channel_post_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("💬 Бот", url=f"https://t.me/{os.getenv('BOT_USERNAME', 'farangfm_bot')}"),
     ]])
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # COMMAND HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"START user={update.effective_user.id}")
@@ -273,9 +378,9 @@ async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # MODERATION CALLBACKS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 async def approve_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -356,9 +461,9 @@ async def edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Edit cancelled.")
     return ConversationHandler.END
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # MAIN MENU CALLBACKS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -416,20 +521,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(tx(uid, "advertise_text"), reply_markup=kb, parse_mode=ParseMode.HTML)
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # ERROR HANDLER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 # MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================
 
 def main():
-    # Запуск health server
-    Thread(target=run_health_server, daemon=True).start()
+    # Запуск HTTP сервера в отдельном потоке (health + webhook)
+    Thread(target=run_http_server, daemon=True).start()
     
     # Инициализация базы данных
     try:
@@ -439,11 +544,13 @@ def main():
         logger.error(f"Failed to initialize database: {e}")
         sys.exit(1)
     
-    logger.info("🤖 FARANG.FM Bot v5.0 starting...")
+    logger.info("🤖 FARANG.FM Bot v6.0 starting...")
     logger.info(f"📡 Channel: {CHANNEL_ID}  |  👤 Admin: {ADMIN_ID}")
     logger.info("⏰ Scheduled posts and AI generation are handled by n8n")
+    logger.info("🌐 Webhook endpoint: POST /webhook")
+    logger.info("🏥 Health endpoint: GET /health")
     
-    # Создание приложения
+    # Создание приложения Telegram
     app = Application.builder().token(TOKEN).build()
     
     # Edit-post conversation handler
