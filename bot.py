@@ -1,19 +1,16 @@
 """
-FARANG.FM TELEGRAM BOT v4.0 - Render Ready
+FARANG.FM TELEGRAM BOT v5.0 - Clean Moderation Bot
 - Language selection: RU / EN / TH
 - Listen Now → Telegram Mini App
 - Moderation system: approve / reject / edit
-- Scheduled auto-posts via job_queue
-- Groq AI content generation
-- Admin: /post, /generate, /schedule, /pending
+- Admin: /post, /pending
+- NO built-in AI generation (handled by n8n)
+- NO built-in scheduled posts (handled by n8n)
 """
 
 import os
 import sys
 import logging
-import requests
-import asyncio
-from datetime import datetime, timezone, timedelta
 from functools import wraps
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -28,8 +25,7 @@ from telegram.error import TelegramError
 
 from database import (
     init_db, get_post, update_post_status, update_post_text,
-    get_pending_posts, get_schedule,
-    add_scheduled_post, toggle_scheduled_post, remove_scheduled_post,
+    get_pending_posts,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -39,11 +35,9 @@ from database import (
 TOKEN       = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID  = os.getenv("CHANNEL_ID", "")
 ADMIN_ID    = int(os.getenv("ADMIN_ID", "0"))
-GROQ_KEY    = os.getenv("GROQ_API_KEY", "")
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://farang-fm.netlify.app/")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/farangfm")
 
-# Проверка обязательных переменных
 if not TOKEN:
     logging.error("BOT_TOKEN not set!")
     sys.exit(1)
@@ -56,20 +50,16 @@ if ADMIN_ID == 0:
     logging.error("ADMIN_ID not set!")
     sys.exit(1)
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Bangkok timezone (UTC+7)
-BKK_TZ = timezone(timedelta(hours=7))
-
 # Conversation state for editing a post
 STATE_EDIT_TEXT = 0
 
-# In-memory language store {user_id: 'ru'|'en'|'th'}
+# In-memory language store
 USER_LANG: dict[int, str] = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -79,7 +69,7 @@ USER_LANG: dict[int, str] = {}
 STREAMS = {"LOFI": "🌙", "CHILL": "🌊", "ROAD": "🛵", "DANCE": "🔥"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HEALTH CHECK SERVER (для Render)
+# HEALTH CHECK SERVER (для Render / UptimeRobot)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -93,7 +83,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass  # Подавляем логи health check
+        pass
 
 def run_health_server():
     port = int(os.getenv("PORT", 8080))
@@ -232,47 +222,6 @@ def channel_post_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GROQ AI
-# ═══════════════════════════════════════════════════════════════════════════════
-
-GROQ_PROMPT = """You are a content editor for FARANG.FM — an online radio station from Thailand.
-
-Stream: {stream}
-Topic/source: {topic}
-
-Write a short, catchy Telegram post (80-130 words) in this style:
-- Fun, casual, tropical vibe
-- Focus on music & atmosphere of the {stream} stream
-- Add relevant emojis
-- Include hashtags #FARANGFM and 1-2 topical ones
-- Start with a strong hook
-- End with a call-to-action (listen, join, vibe with us)
-- Mix of English with optional Russian/Thai flavor words
-
-Output ONLY the post text, no explanations."""
-
-def groq_generate(stream: str, topic: str) -> str | None:
-    if not GROQ_KEY:
-        return None
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "mixtral-8x7b-32768",
-                "messages": [{"role": "user", "content": GROQ_PROMPT.format(stream=stream, topic=topic)}],
-                "temperature": 0.8,
-                "max_tokens": 250,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error(f"Groq error: {e}")
-        return None
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -308,38 +257,6 @@ async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(tx(uid, "post_error", err=str(e)), parse_mode=ParseMode.HTML)
 
 @admin_only
-async def generate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text(
-            "<b>Usage:</b> /generate &lt;STREAM&gt; &lt;topic&gt;\n\n"
-            "Example:\n/generate LOFI thai new year",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    stream = args[0].upper()
-    if stream not in STREAMS:
-        await update.message.reply_text(f"❌ Unknown stream: {stream}")
-        return
-    topic = " ".join(args[1:])
-    msg = await update.message.reply_text("✍️ Generating with Groq AI...")
-
-    result = groq_generate(stream, topic)
-    if not result:
-        await msg.edit_text("❌ Groq unavailable. Check GROQ_API_KEY secret.")
-        return
-
-    emoji = STREAMS[stream]
-    preview = f"{emoji} <b>{stream}</b>\n\n{result}"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Publish to Channel", callback_data=f"genpub_{stream}"),
-         InlineKeyboardButton("❌ Discard", callback_data="gen_discard")],
-    ])
-    context.user_data["gen_text"] = result
-    context.user_data["gen_stream"] = stream
-    await msg.edit_text(preview, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-@admin_only
 async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     posts = get_pending_posts()
     if not posts:
@@ -355,74 +272,6 @@ async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{pid}")],
         ])
         await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-@admin_only
-async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or []
-    sched = get_schedule()
-
-    if not args:
-        if not sched:
-            await update.message.reply_text("📅 No scheduled posts.")
-            return
-        lines = ["<b>📅 Scheduled Posts</b>\n"]
-        for key, info in sched.items():
-            status = "✅" if info.get("enabled") else "⏸️"
-            lines.append(f"{status} <b>{info['display_name']}</b> — {info['time_value']} ({info['stream']})")
-        lines.append("\n<i>Commands:</i> /schedule on|off|del &lt;key&gt;")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-        return
-
-    sub = args[0].lower()
-
-    if sub == "on" and len(args) >= 2:
-        toggle_scheduled_post(args[1], True)
-        await update.message.reply_text(f"✅ <b>{args[1]}</b> enabled.", parse_mode=ParseMode.HTML)
-    elif sub == "off" and len(args) >= 2:
-        toggle_scheduled_post(args[1], False)
-        await update.message.reply_text(f"⏸️ <b>{args[1]}</b> paused.", parse_mode=ParseMode.HTML)
-    elif sub == "del" and len(args) >= 2:
-        remove_scheduled_post(args[1])
-        await update.message.reply_text(f"🗑️ <b>{args[1]}</b> deleted.", parse_mode=ParseMode.HTML)
-    elif sub == "add" and len(args) >= 5:
-        key, time_val, stream_val = args[1], args[2], args[3].upper()
-        tmpl = " ".join(args[4:])
-        if stream_val not in STREAMS:
-            await update.message.reply_text(f"❌ Unknown stream: {stream_val}")
-            return
-        add_scheduled_post(key, key.replace("_", " ").title(), time_val, stream_val, tmpl)
-        await update.message.reply_text(f"✅ Added <b>{key}</b> at {time_val}.", parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text(
-            "<b>Usage:</b>\n"
-            "/schedule — list all\n"
-            "/schedule on|off|del &lt;key&gt;\n"
-            "/schedule add &lt;key&gt; &lt;HH:MM&gt; &lt;STREAM&gt; &lt;text&gt;",
-            parse_mode=ParseMode.HTML,
-        )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# JOB QUEUE: auto-publish scheduled posts (Bangkok timezone)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def scheduled_post_job(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now(BKK_TZ).strftime("%H:%M")
-    for key, info in get_schedule().items():
-        if not info.get("enabled"):
-            continue
-        if info.get("time_value") != now:
-            continue
-        stream = info.get("stream", "LOFI")
-        emoji = STREAMS.get(stream, "🎵")
-        text = info.get("template", "").format(stream=stream, emoji=emoji)
-        try:
-            await context.bot.send_message(
-                chat_id=CHANNEL_ID, text=text,
-                reply_markup=channel_post_keyboard(), parse_mode=ParseMode.HTML,
-            )
-            logger.info(f"SCHEDULED_POST key={key} stream={stream} time={now} (Bangkok)")
-        except TelegramError as e:
-            logger.error(f"Scheduled post error ({key}): {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MODERATION CALLBACKS
@@ -567,26 +416,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(tx(uid, "advertise_text"), reply_markup=kb, parse_mode=ParseMode.HTML)
 
-    elif data.startswith("genpub_"):
-        stream = data[7:]
-        emoji = STREAMS.get(stream, "🎵")
-        text = context.user_data.pop("gen_text", "")
-        full = f"{emoji} <b>{stream}</b>\n\n{text}"
-        context.user_data.pop("gen_stream", None)
-        try:
-            await context.bot.send_message(
-                chat_id=CHANNEL_ID, text=full,
-                reply_markup=channel_post_keyboard(), parse_mode=ParseMode.HTML,
-            )
-            await query.edit_message_text(f"✅ Published! {emoji} {stream}", parse_mode=ParseMode.HTML)
-        except TelegramError as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-
-    elif data == "gen_discard":
-        context.user_data.pop("gen_text", None)
-        context.user_data.pop("gen_stream", None)
-        await query.edit_message_text("🗑️ Discarded.")
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # ERROR HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -599,7 +428,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # Запуск health server в отдельном потоке
+    # Запуск health server
     Thread(target=run_health_server, daemon=True).start()
     
     # Инициализация базы данных
@@ -610,10 +439,9 @@ def main():
         logger.error(f"Failed to initialize database: {e}")
         sys.exit(1)
     
-    logger.info("🤖 FARANG.FM Bot v4.0 starting...")
+    logger.info("🤖 FARANG.FM Bot v5.0 starting...")
     logger.info(f"📡 Channel: {CHANNEL_ID}  |  👤 Admin: {ADMIN_ID}")
-    logger.info(f"🤖 Groq AI: {'enabled' if GROQ_KEY else 'DISABLED — set GROQ_API_KEY'}")
-    logger.info(f"🌐 Website: {WEBSITE_URL}")
+    logger.info("⏰ Scheduled posts and AI generation are handled by n8n")
     
     # Создание приложения
     app = Application.builder().token(TOKEN).build()
@@ -630,21 +458,11 @@ def main():
     app.add_handler(edit_conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("post", post_cmd))
-    app.add_handler(CommandHandler("generate", generate_cmd))
     app.add_handler(CommandHandler("pending", pending_cmd))
-    app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CallbackQueryHandler(approve_post, pattern="^approve_"))
     app.add_handler(CallbackQueryHandler(reject_post, pattern="^reject_"))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(error_handler)
-    
-    # Scheduled posts: check every minute (only if JobQueue is available)
-    if app.job_queue:
-        app.job_queue.run_repeating(scheduled_post_job, interval=60, first=10)
-        logger.info("⏰ Scheduled posts enabled")
-    else:
-        logger.warning("⚠️ JobQueue not available. Scheduled posts disabled.")
-        logger.warning("To enable, install: pip install 'python-telegram-bot[job-queue]'")
     
     logger.info("🚀 Bot is running! Starting polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
